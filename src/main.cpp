@@ -4,136 +4,85 @@
 
 // ********************
 
+// CAN frame format (8 bytes, RP2040 interface -> motor controller):
+// Byte 0:   SOF byte 1 (0xAA)
+// Byte 1:   SOF byte 2 (0x55)
+// Byte 2:   Sequence number (uint8)
+// Byte 3:   Flags (uint8 bit field)
+// Byte 4:   Speed low byte  (int16, little-endian, mm/s)
+// Byte 5:   Speed high byte
+// Byte 6:   Steer low byte  (int16, little-endian, mrad)
+// Byte 7:   Steer high byte
+// CAN IDs: FL=0x120, FR=0x121, RL=0x122, RR=0x123 (commands in)
+//          FL=0x220, FR=0x221, RL=0x222, RR=0x223 (feedback out)
 
 #include <Arduino.h>
 #include <Adafruit_MCP2515.h>
 #include <SPI.h>
-
 #include "mcp25125_config.h"
 #include "neopixel_config.h"
 #include <Adafruit_NeoPixel.h>
 
-// Motor designation (set these according to which wheel this controller is attached to)
-struct {
-  int position = 0; // 0=front-left, 1=front-right, 2=rear-left, 3=rear-right
-  int purpose = 0;  // 0=speed, 1=steer
-}motor_designation;
+// Node configuration — set per board:
+// Front Left  = CAN_ID_FL_TX, Front Right = CAN_ID_FR_TX
+// Rear Left   = CAN_ID_RL_TX, Rear Right  = CAN_ID_RR_TX
+static constexpr uint32_t NODE_CAN_ID  = mcp25125_config::CAN_ID_FL_TX;
+static constexpr uint8_t  NODE_PURPOSE = 0; // 0=speed, 1=steer
 
 // Motor control pins
-static const int MOTOR_PWM_PIN = 5;
-static const int MOTOR_DIR_PIN = 4;
+static constexpr int MOTOR_PWM_PIN = 5;
+static constexpr int MOTOR_DIR_PIN = 4;
 
-unsigned long last_valid_packet = 0;
-const unsigned long timeout_ms = 500;   // adjust as needed
-bool motor_timed_out = true;
-// Must match the TX side's CAN ID and payload format:
-static constexpr uint32_t CAN_BITRATE = 500000;
-// If you only care about this ID, set it here
-static constexpr uint32_t CAN_ID_RX = 0x123;
+static constexpr unsigned long TIMEOUT_MS = 500;
+
+struct MotorState {
+  int16_t  cmd_speed;      // mm/s
+  int16_t  cmd_steer;      // mrad
+  unsigned long last_valid_ms;
+  bool     timed_out;
+};
+
+MotorState motor_state = {0, 0, 0, true};
 
 Adafruit_NeoPixel pixel(1, neopixel_config::NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
-// SPI-pin constructor (as in your TX code)
 Adafruit_MCP2515 mcp(mcp25125_config::PIN_CAN_CS,
                      mcp25125_config::PIN_CAN_MOSI,
                      mcp25125_config::PIN_CAN_MISO,
                      mcp25125_config::PIN_CAN_SCK);
 
-static uint8_t crc8_atm(const uint8_t* data, size_t len, uint8_t poly = 0x07, uint8_t init = 0x00) {
-  uint8_t crc = init;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; b++) {
-      if (crc & 0x80) crc = (uint8_t)((crc << 1) ^ poly);
-      else crc <<= 1;
-    }
-  }
-  return crc;
-}
-
-static void neopixel_blink(uint8_t r, uint8_t g, uint8_t b, uint16_t ms = 20) {
-
-  pixel.setPixelColor(0, pixel.Color(r, g, b));
-  pixel.show();
-  delay(ms);
-  pixel.clear();
-  pixel.show();
-}
-
-void setMotor(float cmd)
-{
+void set_motor(int16_t speed, int16_t steer) {
+  float cmd = (NODE_PURPOSE == 0) ? speed / 1000.0f : steer / 1000.0f;
   cmd = constrain(cmd, -1.0f, 1.0f);
-
   bool forward = cmd >= 0.0f;
-  float mag = fabs(cmd);
-
-  int duty = (int)(mag * 255.0f);
-
+  int duty = (int)(fabs(cmd) * 255.0f);
   digitalWrite(MOTOR_DIR_PIN, forward ? HIGH : LOW);
   analogWrite(MOTOR_PWM_PIN, duty);
 }
 
-// Decode your 8-byte payload format for ID 0x123:
-// [0]=seq [1]=flags [2..3]=lin_i16 [4..5]=ang_i16 [6]=rx_crc [7]=0
-static void decode_if_matching(uint32_t id, const uint8_t* data, uint8_t len) {
-  
-  if (id != CAN_ID_RX) return;
+// Returns true if packet matches this node and passes validation
+bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
+  if (id != NODE_CAN_ID) return false;
   if (len != 8) {
-    Serial.print("ID 0x");
-    Serial.print(id, HEX);
-    Serial.print(" unexpected DLC=");
-    Serial.println(len);
-    return;
+    Serial.print("ID 0x"); Serial.print(id, HEX);
+    Serial.print(" unexpected DLC="); Serial.println(len);
+    return false;
   }
+  if (data[0] != 0xAA || data[1] != 0x55) return false;
 
-  // Validate SOF
-  if (data[0] != 0xAA || data[1] != 0x55) return; // bad frame
+  motor_state.cmd_speed = (int16_t)(data[4] | (data[5] << 8));
+  motor_state.cmd_steer = (int16_t)(data[6] | (data[7] << 8));
 
-  const uint8_t seq   = data[2];
-  const uint8_t flags = data[3];
+  uint8_t seq   = data[2];
+  uint8_t flags = data[3];
 
-  int16_t driveValue = 0; // default if position/purpose invalid
-  switch(motor_designation.position){
-    case 0: 
-      if(motor_designation.purpose == 0){  driveValue = 1000 * (int16_t)(data[4]  | (data[5]  << 8));}
-      else {driveValue = 1000 * (int16_t)(data[6]  | (data[7]  << 8));}
-      break;
-    case 1:
-      if(motor_designation.purpose == 0){  driveValue = 1000 * (int16_t)(data[8]  | (data[9]  << 8));}
-      else {driveValue = 1000 * (int16_t)(data[10] | (data[11] << 8));}
-      break;
-    case 2:
-      if(motor_designation.purpose == 0){  driveValue = 1000 * (int16_t)(data[12] | (data[13] << 8));}
-      else {driveValue = 1000 * (int16_t)(data[14] | (data[15] << 8));}
-      break;
-    case 3: 
-      if(motor_designation.purpose == 0){  driveValue = 1000 * (int16_t)(data[16] | (data[17] << 8));}
-      else {driveValue = 1000 * (int16_t)(data[18] | (data[19] << 8));}
-      break;
-    default: Serial.println("Invalid motor position in motor_designation struct"); 
-      break;
-  }
+  Serial.print("seq="); Serial.print(seq);
+  Serial.print(" flags=0x"); Serial.print(flags, HEX);
+  Serial.print(" speed="); Serial.print(motor_state.cmd_speed);
+  Serial.print(" steer="); Serial.println(motor_state.cmd_steer);
 
-  const uint8_t rx_crc = data[12];
-  const uint8_t calc   = crc8_atm(data, 12); // CRC over first 12 bytes
-
-  if (calc == rx_crc) {
-    Serial.println(" CRC=OK");
-    neopixel_blink(0, 255, 0); // green
-
-    last_valid_packet = millis();
-    motor_timed_out = false;
-    setMotor(driveValue);
-
-  } else {
-    Serial.print(" CRC=BAD rx=");
-    Serial.print(rx_crc, HEX);
-    Serial.print(" calc=");
-    Serial.println(calc, HEX);
-    neopixel_blink(255, 0, 0, 60); // red
-  }
+  return true;
 }
-
 
 void setup() {
   Serial.begin(115200);
@@ -141,12 +90,11 @@ void setup() {
 
   Serial.println("Init CAN RX...");
 
-  // Wake transceiver / release reset (as in your code)
   pinMode(mcp25125_config::PIN_CAN_STANDBY, OUTPUT);
-  digitalWrite(mcp25125_config::PIN_CAN_STANDBY, LOW);   // normal (not standby)
+  digitalWrite(mcp25125_config::PIN_CAN_STANDBY, LOW);   // LOW = normal operation
 
   pinMode(mcp25125_config::PIN_CAN_RESET, OUTPUT);
-  digitalWrite(mcp25125_config::PIN_CAN_RESET, HIGH);    // not in reset (active-low)
+  digitalWrite(mcp25125_config::PIN_CAN_RESET, HIGH);    // HIGH = not in reset (active-low)
 
   delay(10);
 
@@ -156,16 +104,18 @@ void setup() {
   }
   Serial.println("CAN initialized OK");
 
-  // NeoPixel setup
   pinMode(neopixel_config::NEOPIXEL_POWER_PIN, OUTPUT);
   digitalWrite(neopixel_config::NEOPIXEL_POWER_PIN, HIGH);
-
   pixel.begin();
   pixel.setBrightness(20);
   pixel.clear();
   pixel.show();
 
-  neopixel_blink(0, 0, 255, 80); // blue = boot ok
+  pixel.setPixelColor(0, pixel.Color(0, 0, 255)); // blue = boot ok
+  pixel.show();
+  delay(80);
+  pixel.clear();
+  pixel.show();
 
   pinMode(MOTOR_PWM_PIN, OUTPUT);
   pinMode(MOTOR_DIR_PIN, OUTPUT);
@@ -175,13 +125,9 @@ void loop() {
   int packetSize = mcp.parsePacket();
 
   if (packetSize > 0) {
-    uint32_t id = mcp.packetId();
-    bool ext = mcp.packetExtended();
-    bool rtr = mcp.packetRtr();
-
-    uint8_t data[13] = {0};
-    uint8_t len = (uint8_t)packetSize;
-    if (len > 13) len = 13;
+    uint32_t id  = mcp.packetId();
+    uint8_t  data[8] = {0};
+    uint8_t  len = min((uint8_t)packetSize, (uint8_t)8);
 
     for (uint8_t i = 0; i < len; i++) {
       int c = mcp.read();
@@ -189,21 +135,25 @@ void loop() {
       data[i] = (uint8_t)c;
     }
 
-    for (uint8_t i = 0; i < len; i++) {
-      if (data[i] < 0x10) Serial.print('0');
-      Serial.print(data[i], HEX);
-      Serial.print(' ');
+    if (decode_can_packet(id, data, len)) {
+      motor_state.last_valid_ms = millis();
+      motor_state.timed_out = false;
+      set_motor(motor_state.cmd_speed, motor_state.cmd_steer);
+      pixel.setPixelColor(0, pixel.Color(0, 255, 0));
+      pixel.show();
+      pixel.clear();
     }
-    Serial.println();
-
-    decode_if_matching(id, data, len);
   }
 
-  // Timeout watchdog always runs, even if no packet arrived
-  if (!motor_timed_out && (millis() - last_valid_packet > timeout_ms)) {
+  // Watchdog: stop motor if commands stop arriving
+  if (!motor_state.timed_out && (millis() - motor_state.last_valid_ms > TIMEOUT_MS)) {
     Serial.println("Command timeout -> stopping motor");
-    setMotor(0.0f);
-    motor_timed_out = true;
-    neopixel_blink(255, 255, 0, 80); // yellow for timeout
+    set_motor(0, 0);
+    motor_state.timed_out = true;
+    pixel.setPixelColor(0, pixel.Color(255, 255, 0)); // yellow = timeout
+    pixel.show();
+    delay(80);
+    pixel.clear();
+    pixel.show();
   }
 }
