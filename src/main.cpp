@@ -35,14 +35,14 @@ static constexpr int MOTOR_DIR_PIN = 4;
 
 static constexpr unsigned long TIMEOUT_MS = 500;
 
-struct MotorState {
+struct Motor {
   int16_t  cmd_speed;      // mm/s
   int16_t  cmd_steer;      // mrad
   unsigned long last_valid_ms;
   bool     timed_out;
 };
 
-MotorState motor_state = {0, 0, 0, true};
+Motor motor = {0, 0, 0, true};
 
 Adafruit_NeoPixel pixel(1, neopixel_config::NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -70,16 +70,16 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
   }
   if (data[0] != 0xAA || data[1] != 0x55) return false;
 
-  motor_state.cmd_speed = (int16_t)(data[4] | (data[5] << 8));
-  motor_state.cmd_steer = (int16_t)(data[6] | (data[7] << 8));
+  motor.cmd_speed = (int16_t)(data[4] | (data[5] << 8));
+  motor.cmd_steer = (int16_t)(data[6] | (data[7] << 8));
 
   uint8_t seq   = data[2];
   uint8_t flags = data[3];
 
   Serial.print("seq="); Serial.print(seq);
   Serial.print(" flags=0x"); Serial.print(flags, HEX);
-  Serial.print(" speed="); Serial.print(motor_state.cmd_speed);
-  Serial.print(" steer="); Serial.println(motor_state.cmd_steer);
+  Serial.print(" speed="); Serial.print(motor.cmd_speed);
+  Serial.print(" steer="); Serial.println(motor.cmd_steer);
 
   return true;
 }
@@ -136,9 +136,9 @@ void loop() {
     }
 
     if (decode_can_packet(id, data, len)) {
-      motor_state.last_valid_ms = millis();
-      motor_state.timed_out = false;
-      set_motor(motor_state.cmd_speed, motor_state.cmd_steer);
+      motor.last_valid_ms = millis();
+      motor.timed_out = false;
+      set_motor(motor.cmd_speed, motor.cmd_steer);
       pixel.setPixelColor(0, pixel.Color(0, 255, 0));
       pixel.show();
       pixel.clear();
@@ -146,10 +146,10 @@ void loop() {
   }
 
   // Watchdog: stop motor if commands stop arriving
-  if (!motor_state.timed_out && (millis() - motor_state.last_valid_ms > TIMEOUT_MS)) {
+  if (!motor.timed_out && (millis() - motor.last_valid_ms > TIMEOUT_MS)) {
     Serial.println("Command timeout -> stopping motor");
     set_motor(0, 0);
-    motor_state.timed_out = true;
+    motor.timed_out = true;
     pixel.setPixelColor(0, pixel.Color(255, 255, 0)); // yellow = timeout
     pixel.show();
     delay(80);
