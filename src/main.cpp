@@ -73,6 +73,37 @@ void setMotor(float cmd)
   analogWrite(MOTOR_PWM_PIN, duty);
 }
 
+// NOTE: Function below sends an 8-byte CAN frame containing linear velocity.
+// If linear_velocity == 0, the receiver/control side can treat that as braking
+// and set the NeoPixel purple there. I only addded the function without changing anything else.
+// Purple LED for braking should be handled on the receive/control side
+// where braking is actually detected and applied.
+
+// CAN TX Helper (feature/braking)
+bool sendCANDataField(Adafruit_MCP2515 &mcp, uint32_t can_id, int16_t linear_velocity) {
+  uint8_t data[8] = {0};
+
+  data[0] = 0xAA;
+  data[1] = 0x55;
+  data[2] = (uint8_t)(linear_velocity & 0xFF);
+  data[3] = (uint8_t)((linear_velocity >> 8) & 0xFF);
+  data[4] = 0;
+  data[5] = 0;
+  data[6] = 0;
+  data[7] = 0;
+
+  if (mcp.beginPacket(can_id) != 0) {
+    return false;
+  }
+
+  if (mcp.write(data, 8) != 8) {
+    mcp.endPacket();
+    return false;
+  }
+  
+  return mcp.endPacket() == 0;
+}
+
 // Decode your 8-byte payload format for ID 0x123:
 // [0]=seq [1]=flags [2..3]=lin_i16 [4..5]=ang_i16 [6]=rx_crc [7]=0
 static void decode_if_matching(uint32_t id, const uint8_t* data, uint8_t len) {
