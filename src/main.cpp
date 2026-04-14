@@ -86,7 +86,7 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); }
+  //while (!Serial) { delay(10); }
 
   Serial.println("Init CAN RX...");
 
@@ -97,6 +97,8 @@ void setup() {
   digitalWrite(mcp25125_config::PIN_CAN_RESET, HIGH);    // HIGH = not in reset (active-low)
 
   delay(10);
+
+  
 
   if (!mcp.begin(mcp25125_config::CAN_BITRATE)) {
     Serial.println("CAN init failed");
@@ -119,6 +121,9 @@ void setup() {
 
   pinMode(MOTOR_PWM_PIN, OUTPUT);
   pinMode(MOTOR_DIR_PIN, OUTPUT);
+
+  digitalWrite(MOTOR_DIR_PIN, HIGH);
+  analogWrite(MOTOR_PWM_PIN, 255);
 }
 
 void loop() {
