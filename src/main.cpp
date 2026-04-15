@@ -4,17 +4,17 @@
 
 // ********************
 
-// CAN frame format (8 bytes, RP2040 interface -> motor controller):
+// CAN frame format (8 bytes, RP2040 -> motor controller):
 // Byte 0:   SOF byte 1 (0xAA)
 // Byte 1:   SOF byte 2 (0x55)
 // Byte 2:   Sequence number (uint8)
 // Byte 3:   Flags (uint8 bit field)
-// Byte 4:   Speed low byte  (int16, little-endian, mm/s)
-// Byte 5:   Speed high byte
-// Byte 6:   Steer low byte  (int16, little-endian, mrad)
-// Byte 7:   Steer high byte
-// CAN IDs: FL=0x120, FR=0x121, RL=0x122, RR=0x123 (commands in)
-//          FL=0x220, FR=0x221, RL=0x222, RR=0x223 (feedback out)
+// Byte 4:   left Speed low byte  (int16, little-endian, mm/s)
+// Byte 5:   left Speed high byte
+// Byte 6:   right Speed low byte  (int16, little-endian, mm/s)
+// Byte 7:   right Speed high byte
+// CAN IDs: FL=0x120, FR=0x121 (TX)
+//          FL=0x220, FR=0x221 (RX feedback)
 
 #include <Arduino.h>
 #include <Adafruit_MCP2515.h>
@@ -25,9 +25,8 @@
 
 // Node configuration — set per board:
 // Front Left  = CAN_ID_FL_TX, Front Right = CAN_ID_FR_TX
-// Rear Left   = CAN_ID_RL_TX, Rear Right  = CAN_ID_RR_TX
-static constexpr uint32_t NODE_CAN_ID  = mcp25125_config::CAN_ID_FL_TX;
-static constexpr uint8_t  NODE_PURPOSE = 0; // 0=speed, 1=steer
+static constexpr uint32_t NODE_CAN_ID   = mcp25125_config::CAN_ID_FL_TX;
+static constexpr bool     IS_LEFT_SIDE  = (NODE_CAN_ID == mcp25125_config::CAN_ID_FL_TX);
 
 // Motor control pins
 static constexpr int MOTOR_PWM_PIN = 5;
@@ -36,8 +35,8 @@ static constexpr int MOTOR_DIR_PIN = 4;
 static constexpr unsigned long TIMEOUT_MS = 500;
 
 struct Motor {
-  int16_t  cmd_speed;      // mm/s
-  int16_t  cmd_steer;      // mrad
+  int16_t  cmd_left;       // mm/s
+  int16_t  cmd_right;      // mm/s
   unsigned long last_valid_ms;
   bool     timed_out;
 };
@@ -51,8 +50,8 @@ Adafruit_MCP2515 mcp(mcp25125_config::PIN_CAN_CS,
                      mcp25125_config::PIN_CAN_MISO,
                      mcp25125_config::PIN_CAN_SCK);
 
-void set_motor(int16_t speed, int16_t steer) {
-  float cmd = (NODE_PURPOSE == 0) ? speed / 1000.0f : steer / 1000.0f;
+void set_motor(int16_t left, int16_t right) {
+  float cmd = (IS_LEFT_SIDE ? left : right) / 1000.0f;
   cmd = constrain(cmd, -1.0f, 1.0f);
   bool forward = cmd >= 0.0f;
   int duty = (int)(fabs(cmd) * 255.0f);
@@ -70,16 +69,16 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
   }
   if (data[0] != 0xAA || data[1] != 0x55) return false;
 
-  motor.cmd_speed = (int16_t)(data[4] | (data[5] << 8));
-  motor.cmd_steer = (int16_t)(data[6] | (data[7] << 8));
+  motor.cmd_left  = (int16_t)(data[4] | (data[5] << 8));
+  motor.cmd_right = (int16_t)(data[6] | (data[7] << 8));
 
   uint8_t seq   = data[2];
   uint8_t flags = data[3];
 
   Serial.print("seq="); Serial.print(seq);
   Serial.print(" flags=0x"); Serial.print(flags, HEX);
-  Serial.print(" speed="); Serial.print(motor.cmd_speed);
-  Serial.print(" steer="); Serial.println(motor.cmd_steer);
+  Serial.print(" left="); Serial.print(motor.cmd_left);
+  Serial.print(" right="); Serial.println(motor.cmd_right);
 
   return true;
 }
@@ -143,7 +142,7 @@ void loop() {
     if (decode_can_packet(id, data, len)) {
       motor.last_valid_ms = millis();
       motor.timed_out = false;
-      set_motor(motor.cmd_speed, motor.cmd_steer);
+      set_motor(motor.cmd_left, motor.cmd_right);
       pixel.setPixelColor(0, pixel.Color(0, 255, 0));
       pixel.show();
       pixel.clear();
