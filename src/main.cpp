@@ -19,18 +19,20 @@
 #include <Arduino.h>
 #include <Adafruit_MCP2515.h>
 #include <SPI.h>
+#include <Servo.h>
 #include "mcp25125_config.h"
 #include "neopixel_config.h"
 #include <Adafruit_NeoPixel.h>
 
 // Node configuration — set per board:
 // Front Left  = CAN_ID_FL_TX, Front Right = CAN_ID_FR_TX
-static constexpr uint32_t NODE_CAN_ID   = mcp25125_config::CAN_ID_FL_TX;
+static constexpr uint32_t NODE_CAN_ID   = mcp25125_config::CAN_ID_FR_TX;
 static constexpr bool     IS_LEFT_SIDE  = (NODE_CAN_ID == mcp25125_config::CAN_ID_FL_TX);
 
-// Motor control pins
+// Motor control pin (Talon SRX servo-style PWM)
 static constexpr int MOTOR_PWM_PIN = 5;
-static constexpr int MOTOR_DIR_PIN = 4;
+
+Servo talonSRX;
 
 static constexpr unsigned long TIMEOUT_MS = 500;
 
@@ -51,12 +53,17 @@ Adafruit_MCP2515 mcp(mcp25125_config::PIN_CAN_CS,
                      mcp25125_config::PIN_CAN_SCK);
 
 void set_motor(int16_t left, int16_t right) {
-  float cmd = (IS_LEFT_SIDE ? left : right) / 1000.0f;
+  float cmd = (IS_LEFT_SIDE ? left : right) / 2000.0f;
   cmd = constrain(cmd, -1.0f, 1.0f);
-  bool forward = cmd >= 0.0f;
-  int duty = (int)(fabs(cmd) * 255.0f);
-  digitalWrite(MOTOR_DIR_PIN, forward ? HIGH : LOW);
-  analogWrite(MOTOR_PWM_PIN, duty);
+
+// if (IS_LEFT_SIDE) {
+//     Serial.println("Set LEFT motor cmd=" + String(cmd));
+// } else {
+//     Serial.println("Set RIGHT motor cmd=" + String(cmd));
+// }
+
+  int us = (int)(1500.0f + cmd * 500.0f);  // 1000-2000µs, 1500=stop
+  talonSRX.writeMicroseconds(us);
 }
 
 // Returns true if packet matches this node and passes validation
@@ -75,10 +82,10 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
   uint8_t seq   = data[2];
   uint8_t flags = data[3];
 
-  Serial.print("seq="); Serial.print(seq);
-  Serial.print(" flags=0x"); Serial.print(flags, HEX);
-  Serial.print(" left="); Serial.print(motor.cmd_left);
-  Serial.print(" right="); Serial.println(motor.cmd_right);
+  // Serial.print("seq="); Serial.print(seq);
+  // Serial.print(" flags=0x"); Serial.print(flags, HEX);
+  // Serial.print(" left="); Serial.print(motor.cmd_left);
+  // Serial.print(" right="); Serial.println(motor.cmd_right);
 
   return true;
 }
@@ -118,11 +125,8 @@ void setup() {
   pixel.clear();
   pixel.show();
 
-  pinMode(MOTOR_PWM_PIN, OUTPUT);
-  pinMode(MOTOR_DIR_PIN, OUTPUT);
-
-  digitalWrite(MOTOR_DIR_PIN, HIGH);
-  analogWrite(MOTOR_PWM_PIN, 255);
+  talonSRX.attach(MOTOR_PWM_PIN, 1000, 2000);
+  talonSRX.writeMicroseconds(1500);  // neutral on boot
 }
 
 void loop() {
