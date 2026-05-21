@@ -13,7 +13,7 @@
 // CAN feedback frame (8 bytes, motor controller -> RP2040 not used here;
 // this node TX's feedback on CAN_ID_*_RX):
 // Byte 0-3: tick_count (int32, little-endian)
-// Byte 4-5: reserved
+// Byte 4-5: velocity   (int16, little-endian, mm/s)
 // Byte 6:   flags (bit0 = magnet_detected)
 // Byte 7:   AGC
 //
@@ -45,17 +45,29 @@ static constexpr int I2C_SDA       = 2;
 static constexpr int I2C_SCL       = 3;
 
 // ---------- Encoder calibration (per side) ----------
-// TODO: re-run calibration on the right wheel and fill in
 static constexpr float TICKS_PER_ROTATION =
-    IS_LEFT_SIDE ? 24304.0f : 24304.0f;
+    IS_LEFT_SIDE ? 78586.0f : 78586.0f;
 static constexpr float WHEEL_CIRCUMFERENCE_IN = 50.265f;  // π × 16"
-static constexpr int16_t COMMIT_THRESHOLD     = 40;
+static constexpr float WHEEL_CIRCUMFERENCE_MM = WHEEL_CIRCUMFERENCE_IN * 25.4f;
+
+// ---------- Filter / sampling config ----------
+// IMPORTANT: keep SAMPLE_RATE_HZ in sync with ENCODER_SAMPLE_MS
+//   5 ms  -> 200 Hz
+//   1 ms  -> 1000 Hz
+#define SAMPLE_RATE_HZ 200.0f
+#define VEL_ALPHA      0.15f   // ~33 ms time constant at 200 Hz
+
+// Spike rejection: any single-sample delta larger than this is treated as
+// an I2C glitch. Top speed ~717 LSB/sample at 200 Hz, so 3000 leaves
+// ~4x headroom while still catching wild reads.
+static constexpr int16_t MAX_PLAUSIBLE_DELTA = 3000;
 
 // ---------- Timing ----------
 static constexpr unsigned long TIMEOUT_MS         = 500;
-static constexpr unsigned long ENCODER_SAMPLE_MS  = 5;    // matches old delay(5)
-static constexpr unsigned long FEEDBACK_TX_MS     = 50;   // 20 Hz feedback
+static constexpr unsigned long ENCODER_SAMPLE_MS  = 5;     // 200 Hz
+static constexpr unsigned long FEEDBACK_TX_MS     = 50;    // 20 Hz feedback
 static constexpr unsigned long DEBUG_PRINT_MS     = 200;
+static constexpr unsigned long LED_BLINK_MS       = 30;    // CAN RX blink length
 
 // ---------- State ----------
 Servo talonSRX;
@@ -69,11 +81,14 @@ struct Motor {
 Motor motor = {0, 0, 0, true};
 
 struct Encoder {
-  uint16_t last_raw;
-  long     tick_count;
-  int32_t  accumulator;
   bool     ok;
-} enc = {0, 0, 0, false};
+  uint16_t last_raw;
+  int32_t  tick_count;             // raw accumulated position (no filtering)
+  float    filtered_delta_lsb;     // EMA of per-sample delta
+  float    velocity_lsb_per_sec;   // derived from filtered_delta_lsb
+  uint32_t read_errors;
+};
+Encoder enc = {false, 0, 0, 0.0f, 0.0f, 0};
 
 Adafruit_NeoPixel pixel(1, neopixel_config::NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -83,6 +98,27 @@ Adafruit_MCP2515 mcp(mcp25125_config::PIN_CAN_CS,
                      mcp25125_config::PIN_CAN_SCK);
 
 AS5600 encoder(&Wire1);
+
+// ---------- LED helper (non-blocking blink) ----------
+struct LedBlink {
+  bool active;
+  unsigned long off_at_ms;
+} led = {false, 0};
+
+void led_blink(uint8_t r, uint8_t g, uint8_t b, unsigned long now) {
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+  led.active = true;
+  led.off_at_ms = now + LED_BLINK_MS;
+}
+
+void led_service(unsigned long now) {
+  if (led.active && (long)(now - led.off_at_ms) >= 0) {
+    pixel.clear();
+    pixel.show();
+    led.active = false;
+  }
+}
 
 // ---------- Motor ----------
 void set_motor(int16_t left, int16_t right) {
@@ -116,33 +152,51 @@ void encoder_update() {
   int16_t delta = (int16_t)(raw - enc.last_raw);
   if (delta >  2048) delta -= 4096;
   if (delta < -2048) delta += 4096;
+
+  // Reject implausible jumps (likely I2C read glitches).
+  // Resync last_raw so we don't compound the error, but don't integrate.
+  if (delta > MAX_PLAUSIBLE_DELTA || delta < -MAX_PLAUSIBLE_DELTA) {
+    enc.read_errors++;
+    enc.last_raw = raw;
+    return;
+  }
   enc.last_raw = raw;
 
-  enc.accumulator += delta;
+  // Position: integrate raw delta (integration smooths inherently)
+  enc.tick_count += delta;
 
-  // NOTE: fixed the sign bug from the original (was += in both branches)
-  while (enc.accumulator >= COMMIT_THRESHOLD) {
-    enc.tick_count   += COMMIT_THRESHOLD;
-    enc.accumulator  -= COMMIT_THRESHOLD;
-  }
-  while (enc.accumulator <= -COMMIT_THRESHOLD) {
-    enc.tick_count   -= COMMIT_THRESHOLD;
-    enc.accumulator  += COMMIT_THRESHOLD;
-  }
+  // Velocity: EMA-filtered delta scaled to LSB/sec
+  enc.filtered_delta_lsb = VEL_ALPHA * (float)delta
+                         + (1.0f - VEL_ALPHA) * enc.filtered_delta_lsb;
+  enc.velocity_lsb_per_sec = enc.filtered_delta_lsb * SAMPLE_RATE_HZ;
 }
 
 // ---------- CAN TX feedback ----------
 void send_feedback() {
   uint8_t buf[8] = {0};
-  int32_t ticks = (int32_t)enc.tick_count;
+  int32_t ticks = enc.tick_count;
 
-  buf[0] = (uint8_t)(ticks       & 0xFF);
-  buf[1] = (uint8_t)((ticks >> 8 ) & 0xFF);
+  // Bytes 0-3: tick_count (int32 LE)
+  buf[0] = (uint8_t)( ticks        & 0xFF);
+  buf[1] = (uint8_t)((ticks >>  8) & 0xFF);
   buf[2] = (uint8_t)((ticks >> 16) & 0xFF);
   buf[3] = (uint8_t)((ticks >> 24) & 0xFF);
-  buf[4] = 0;
-  buf[5] = 0;
-  buf[6] = enc.ok && encoder.magnetDetected() ? 0x01 : 0x00;
+
+  // Bytes 4-5: velocity in mm/s (int16 LE)
+  // velocity_mm_per_sec = velocity_lsb_per_sec * (circumference_mm / ticks_per_rev)
+  float vel_mm = enc.velocity_lsb_per_sec
+               * (WHEEL_CIRCUMFERENCE_MM / TICKS_PER_ROTATION);
+  // Clamp to int16 range to avoid wrap on overflow
+  if (vel_mm >  32767.0f) vel_mm =  32767.0f;
+  if (vel_mm < -32768.0f) vel_mm = -32768.0f;
+  int16_t vel_mm_i = (int16_t)vel_mm;
+  buf[4] = (uint8_t)( vel_mm_i       & 0xFF);
+  buf[5] = (uint8_t)((vel_mm_i >> 8) & 0xFF);
+
+  // Byte 6: status flags
+  buf[6] = (enc.ok && encoder.magnetDetected()) ? 0x01 : 0x00;
+
+  // Byte 7: AGC (signal quality)
   buf[7] = enc.ok ? (uint8_t)encoder.readAGC() : 0;
 
   mcp.beginPacket(FEEDBACK_CAN_ID);
@@ -229,10 +283,7 @@ void loop() {
       motor.last_valid_ms = now;
       motor.timed_out = false;
       set_motor(motor.cmd_left, motor.cmd_right);
-      pixel.setPixelColor(0, pixel.Color(0, 255, 0));
-      pixel.show();
-      pixel.clear();
-      pixel.show();
+      led_blink(0, 255, 0, now);   // green flash on valid command
     }
   }
 
@@ -254,10 +305,16 @@ void loop() {
   static unsigned long last_print = 0;
   if (now - last_print >= DEBUG_PRINT_MS) {
     last_print = now;
-    float rotations   = enc.tick_count / TICKS_PER_ROTATION;
+    float rotations   = (float)enc.tick_count / TICKS_PER_ROTATION;
     float distance_in = rotations * WHEEL_CIRCUMFERENCE_IN;
-    Serial.printf("Ticks: %ld   Rot: %.3f   Dist: %.2f in   cmd_L=%d cmd_R=%d\n",
-                  enc.tick_count, rotations, distance_in,
+    float vel_mm_s    = enc.velocity_lsb_per_sec
+                      * (WHEEL_CIRCUMFERENCE_MM / TICKS_PER_ROTATION);
+    float vel_mph     = vel_mm_s * 0.00223694f;
+    Serial.printf("Ticks: %ld  Rot: %.3f  Dist: %.2f in  Vel: %.0f mm/s (%.2f mph)  "
+                  "raw=%u  errs=%lu  cmd_L=%d cmd_R=%d\n",
+                  (long)enc.tick_count, rotations, distance_in,
+                  vel_mm_s, vel_mph,
+                  enc.last_raw, (unsigned long)enc.read_errors,
                   motor.cmd_left, motor.cmd_right);
   }
 
@@ -266,10 +323,9 @@ void loop() {
     Serial.println("Command timeout -> stopping motor");
     set_motor(0, 0);
     motor.timed_out = true;
-    pixel.setPixelColor(0, pixel.Color(255, 255, 0));
-    pixel.show();
-    delay(80);
-    pixel.clear();
-    pixel.show();
+    led_blink(255, 255, 0, now);   // yellow flash on timeout
   }
+
+  // --- Service non-blocking LED ---
+  led_service(now);
 }
