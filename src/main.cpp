@@ -46,8 +46,8 @@ static constexpr int I2C_SCL       = 3;
 
 // ---------- Encoder calibration (per side) ----------
 static constexpr float TICKS_PER_ROTATION =
-    IS_LEFT_SIDE ? 78586.0f : 78586.0f;
-static constexpr float WHEEL_CIRCUMFERENCE_IN = 50.265f;  // π × 16"
+    IS_LEFT_SIDE ? 33649.0f : 33649.0f;
+static constexpr float WHEEL_CIRCUMFERENCE_IN = 46.24f;  // π × 16"
 static constexpr float WHEEL_CIRCUMFERENCE_MM = WHEEL_CIRCUMFERENCE_IN * 25.4f;
 
 // ---------- Filter / sampling config ----------
@@ -144,31 +144,40 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
 }
 
 // ---------- Encoder ----------
+// ---------- Encoder ----------
 void encoder_update() {
   if (!enc.ok) return;
 
   uint16_t raw = encoder.readAngle();
 
+  // Compute wrapped delta in LSB
   int16_t delta = (int16_t)(raw - enc.last_raw);
   if (delta >  2048) delta -= 4096;
   if (delta < -2048) delta += 4096;
 
-  // Reject implausible jumps (likely I2C read glitches).
-  // Resync last_raw so we don't compound the error, but don't integrate.
-  if (delta > MAX_PLAUSIBLE_DELTA || delta < -MAX_PLAUSIBLE_DELTA) {
+  // Spike rejection: top speed is ~720 LSB/sample at 200 Hz.
+  // Anything beyond 800 is an I2C glitch — discard and resync.
+  if (delta > 800 || delta < -800) {
     enc.read_errors++;
     enc.last_raw = raw;
     return;
   }
   enc.last_raw = raw;
 
-  // Position: integrate raw delta (integration smooths inherently)
+  if (!IS_LEFT_SIDE) delta = -delta;
+
+  // Position: integrate raw delta (integration is inherently smoothing)
   enc.tick_count += delta;
 
-  // Velocity: EMA-filtered delta scaled to LSB/sec
+  // Velocity: EMA-filtered delta
   enc.filtered_delta_lsb = VEL_ALPHA * (float)delta
                          + (1.0f - VEL_ALPHA) * enc.filtered_delta_lsb;
-  enc.velocity_lsb_per_sec = enc.filtered_delta_lsb * SAMPLE_RATE_HZ;
+
+  // Deadband on velocity output: anything below noise floor reads as zero.
+  // 1.5 LSB/sample at 200 Hz = ~300 LSB/sec ≈ 8 mm/s. Tune to taste.
+  float vel_lsb = enc.filtered_delta_lsb;
+  if (vel_lsb > -1.5f && vel_lsb < 1.5f) vel_lsb = 0.0f;
+  enc.velocity_lsb_per_sec = vel_lsb * SAMPLE_RATE_HZ;
 }
 
 // ---------- CAN TX feedback ----------
@@ -244,7 +253,7 @@ void setup() {
   Wire1.setSDA(I2C_SDA);
   Wire1.setSCL(I2C_SCL);
   Wire1.begin();
-  Wire1.setClock(400000);
+  Wire1.setClock(100000);
 
   encoder.begin();
   if (!encoder.isConnected()) {
@@ -316,6 +325,11 @@ void loop() {
                   vel_mm_s, vel_mph,
                   enc.last_raw, (unsigned long)enc.read_errors,
                   motor.cmd_left, motor.cmd_right);
+
+    uint16_t raw1 = encoder.readAngle();
+delayMicroseconds(100);
+uint16_t raw2 = encoder.readAngle();
+Serial.printf("  raw1=%u raw2=%u diff=%d\n", raw1, raw2, (int)raw2-(int)raw1);
   }
 
   // --- Watchdog ---
