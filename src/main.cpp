@@ -1,7 +1,9 @@
 // ********************
 // * a3tsm_rp2040_motor_interface  *
 // ********************
-
+//
+// Hi, Alyssa
+//
 // CAN frame format (8 bytes, RP2040 -> motor controller):
 // Byte 0:   SOF byte 1 (0xAA)
 // Byte 1:   SOF byte 2 (0x55)
@@ -31,7 +33,7 @@
 #include <Adafruit_NeoPixel.h>
 
 // ---------- Node configuration ----------
-static constexpr uint32_t NODE_CAN_ID    = mcp25125_config::CAN_ID_FR_TX;
+static constexpr uint32_t NODE_CAN_ID    = mcp25125_config::CAN_ID_FL_TX;
 static constexpr bool     IS_LEFT_SIDE   = (NODE_CAN_ID == mcp25125_config::CAN_ID_FL_TX);
 
 // Feedback ID: 0x120 -> 0x220, 0x121 -> 0x221
@@ -45,22 +47,42 @@ static constexpr int I2C_SDA       = 2;
 static constexpr int I2C_SCL       = 3;
 
 // ---------- Encoder calibration (per side) ----------
-static constexpr float TICKS_PER_ROTATION =
-    IS_LEFT_SIDE ? 33649.0f : 33649.0f;
-static constexpr float WHEEL_CIRCUMFERENCE_IN = 46.24f;  // π × 16"
+// AS5600 is a 12-bit magnetic encoder: 4096 LSB per ENCODER revolution.
+// This is fixed by the hardware and is what readAngle() / the wrap logic use.
+static constexpr float LSB_PER_ENCODER_REV = 4096.0f;
+
+// Gearbox between encoder (motor shaft) and wheel: 20:1.
+// Encoder turns 20 times per wheel rotation.
+//   - If the encoder were on the wheel axle, this would be 1.0.
+//   - Verify 20:1 is the FULL reduction (include any secondary belt/chain stage).
+static constexpr float GEAR_RATIO = 20.0f;
+
+// Encoder LSB per one WHEEL rotation — measured empirically per side.
+// Left measured: 82568.  Right: measure by driving one full wheel rotation
+// and reading enc.tick_count delta, then fill in below.
+static constexpr float TICKS_PER_WHEEL_ROTATION =
+    IS_LEFT_SIDE ? 82568.0f : 82568.0f;  // TODO: replace right-side value
+
+static constexpr float WHEEL_CIRCUMFERENCE_IN = 46.24f;  // π × 16" wheel — verify wheel size
 static constexpr float WHEEL_CIRCUMFERENCE_MM = WHEEL_CIRCUMFERENCE_IN * 25.4f;
+
+// Single conversion constant: mm of wheel travel per encoder LSB.
+// Used everywhere velocity/distance is converted, so TX and debug can't drift apart.
+static constexpr float MM_PER_LSB =
+    WHEEL_CIRCUMFERENCE_MM / TICKS_PER_WHEEL_ROTATION;
 
 // ---------- Filter / sampling config ----------
 // IMPORTANT: keep SAMPLE_RATE_HZ in sync with ENCODER_SAMPLE_MS
 //   5 ms  -> 200 Hz
 //   1 ms  -> 1000 Hz
 #define SAMPLE_RATE_HZ 200.0f
-#define VEL_ALPHA      0.15f   // ~33 ms time constant at 200 Hz
+#define VEL_ALPHA      0.05f   // each stage ~95 ms; cascaded = 2nd-order ~135 ms effective
 
 // Spike rejection: any single-sample delta larger than this is treated as
-// an I2C glitch. Top speed ~717 LSB/sample at 200 Hz, so 3000 leaves
-// ~4x headroom while still catching wild reads.
-static constexpr int16_t MAX_PLAUSIBLE_DELTA = 3000;
+// an I2C glitch.
+// 5 mph = 2235 mm/s → 2235 / (1174.5/82568) / 200 Hz ≈ 785 LSB/sample.
+// 1000 gives ~27% headroom above max speed.
+static constexpr int16_t MAX_PLAUSIBLE_DELTA = 1000;
 
 // ---------- Timing ----------
 static constexpr unsigned long TIMEOUT_MS         = 500;
@@ -84,11 +106,12 @@ struct Encoder {
   bool     ok;
   uint16_t last_raw;
   int32_t  tick_count;             // raw accumulated position (no filtering)
-  float    filtered_delta_lsb;     // EMA of per-sample delta
-  float    velocity_lsb_per_sec;   // derived from filtered_delta_lsb
+  float    ema1;                   // first EMA stage
+  float    ema2;                   // second EMA stage (cascaded for 2nd-order rolloff)
+  float    velocity_lsb_per_sec;   // derived from ema2
   uint32_t read_errors;
 };
-Encoder enc = {false, 0, 0, 0.0f, 0.0f, 0};
+Encoder enc = {false, 0, 0, 0.0f, 0.0f, 0.0f, 0};
 
 Adafruit_NeoPixel pixel(1, neopixel_config::NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -144,20 +167,19 @@ bool decode_can_packet(uint32_t id, const uint8_t* data, uint8_t len) {
 }
 
 // ---------- Encoder ----------
-// ---------- Encoder ----------
 void encoder_update() {
   if (!enc.ok) return;
 
   uint16_t raw = encoder.readAngle();
 
-  // Compute wrapped delta in LSB
+  // Compute wrapped delta in LSB (encoder is 4096 counts/rev)
   int16_t delta = (int16_t)(raw - enc.last_raw);
   if (delta >  2048) delta -= 4096;
   if (delta < -2048) delta += 4096;
 
   // Spike rejection: top speed is ~720 LSB/sample at 200 Hz.
   // Anything beyond 800 is an I2C glitch — discard and resync.
-  if (delta > 800 || delta < -800) {
+  if (delta > MAX_PLAUSIBLE_DELTA || delta < -MAX_PLAUSIBLE_DELTA) {
     enc.read_errors++;
     enc.last_raw = raw;
     return;
@@ -166,16 +188,32 @@ void encoder_update() {
 
   if (!IS_LEFT_SIDE) delta = -delta;
 
-  // Position: integrate raw delta (integration is inherently smoothing)
+  // 7-sample median filter: rejects up to 3 consecutive bad reads that
+  // pass the plausibility threshold.
+  static int16_t med_buf[7] = {0, 0, 0, 0, 0, 0, 0};
+  static uint8_t med_idx    = 0;
+  med_buf[med_idx] = delta;
+  med_idx = (med_idx + 1) % 7;
+  int16_t s[7];
+  memcpy(s, med_buf, sizeof(s));
+  for (int i = 1; i < 7; i++) {
+    int16_t key = s[i]; int j = i - 1;
+    while (j >= 0 && s[j] > key) { s[j+1] = s[j]; j--; }
+    s[j+1] = key;
+  }
+  int16_t med = s[3];
+
+  // Position: use raw delta so a single glitch doesn't corrupt tick_count.
+  // Median has 2-sample lag; raw delta has none.
   enc.tick_count += delta;
 
-  // Velocity: EMA-filtered delta
-  enc.filtered_delta_lsb = VEL_ALPHA * (float)delta
-                         + (1.0f - VEL_ALPHA) * enc.filtered_delta_lsb;
+  // Cascaded double EMA: two stages in series give 2nd-order rolloff
+  // (much steeper noise rejection than a single EMA at the same alpha).
+  enc.ema1 = VEL_ALPHA * (float)med + (1.0f - VEL_ALPHA) * enc.ema1;
+  enc.ema2 = VEL_ALPHA * enc.ema1   + (1.0f - VEL_ALPHA) * enc.ema2;
 
   // Deadband on velocity output: anything below noise floor reads as zero.
-  // 1.5 LSB/sample at 200 Hz = ~300 LSB/sec ≈ 8 mm/s. Tune to taste.
-  float vel_lsb = enc.filtered_delta_lsb;
+  float vel_lsb = enc.ema2;
   if (vel_lsb > -1.5f && vel_lsb < 1.5f) vel_lsb = 0.0f;
   enc.velocity_lsb_per_sec = vel_lsb * SAMPLE_RATE_HZ;
 }
@@ -192,9 +230,9 @@ void send_feedback() {
   buf[3] = (uint8_t)((ticks >> 24) & 0xFF);
 
   // Bytes 4-5: velocity in mm/s (int16 LE)
-  // velocity_mm_per_sec = velocity_lsb_per_sec * (circumference_mm / ticks_per_rev)
-  float vel_mm = enc.velocity_lsb_per_sec
-               * (WHEEL_CIRCUMFERENCE_MM / TICKS_PER_ROTATION);
+  // velocity_mm_per_sec = velocity_lsb_per_sec * MM_PER_LSB
+  //   where MM_PER_LSB = WHEEL_CIRCUMFERENCE_MM / (4096 * GEAR_RATIO)
+  float vel_mm = enc.velocity_lsb_per_sec * MM_PER_LSB;
   // Clamp to int16 range to avoid wrap on overflow
   if (vel_mm >  32767.0f) vel_mm =  32767.0f;
   if (vel_mm < -32768.0f) vel_mm = -32768.0f;
@@ -253,7 +291,7 @@ void setup() {
   Wire1.setSDA(I2C_SDA);
   Wire1.setSCL(I2C_SCL);
   Wire1.begin();
-  Wire1.setClock(100000);
+  Wire1.setClock(50000);  // 50 kHz — more noise margin; raise back to 100000 if read_errors stay low
 
   encoder.begin();
   if (!encoder.isConnected()) {
@@ -314,10 +352,9 @@ void loop() {
   static unsigned long last_print = 0;
   if (now - last_print >= DEBUG_PRINT_MS) {
     last_print = now;
-    float rotations   = (float)enc.tick_count / TICKS_PER_ROTATION;
+    float rotations   = (float)enc.tick_count / TICKS_PER_WHEEL_ROTATION;
     float distance_in = rotations * WHEEL_CIRCUMFERENCE_IN;
-    float vel_mm_s    = enc.velocity_lsb_per_sec
-                      * (WHEEL_CIRCUMFERENCE_MM / TICKS_PER_ROTATION);
+    float vel_mm_s    = enc.velocity_lsb_per_sec * MM_PER_LSB;
     float vel_mph     = vel_mm_s * 0.00223694f;
     Serial.printf("Ticks: %ld  Rot: %.3f  Dist: %.2f in  Vel: %.0f mm/s (%.2f mph)  "
                   "raw=%u  errs=%lu  cmd_L=%d cmd_R=%d\n",
@@ -327,9 +364,9 @@ void loop() {
                   motor.cmd_left, motor.cmd_right);
 
     uint16_t raw1 = encoder.readAngle();
-delayMicroseconds(100);
-uint16_t raw2 = encoder.readAngle();
-Serial.printf("  raw1=%u raw2=%u diff=%d\n", raw1, raw2, (int)raw2-(int)raw1);
+    delayMicroseconds(100);
+    uint16_t raw2 = encoder.readAngle();
+    Serial.printf("  raw1=%u raw2=%u diff=%d\n", raw1, raw2, (int)raw2 - (int)raw1);
   }
 
   // --- Watchdog ---
